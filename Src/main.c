@@ -22,8 +22,16 @@
 #include "defines.h"
 #include "setup.h"
 #include "config.h"
+#include "hd44780.h"
 
 void SystemClock_Config(void);
+TIM_HandleTypeDef htim3;
+
+LCD_PCF8574_HandleTypeDef lcd;
+extern I2C_HandleTypeDef hi2c2;
+extern uint32_t rc_delay;
+extern uint32_t temp_delay;
+extern uint8_t ppm_count;
 
 int cmd1;
 int cmd2;
@@ -32,34 +40,24 @@ int cmd3;
 int steer;
 int speed;
 
-extern TIM_HandleTypeDef htim_left;
 extern TIM_HandleTypeDef htim_right;
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern volatile adc_buf_t adc_buffer;
-#ifdef CONTROL_PPM
-extern volatile uint16_t ppm_captured_value[PPM_NUM_CHANNELS+1];
-#endif
 
-extern volatile int pwml;
+
 extern volatile int pwmr;
-extern volatile int weakl;
-extern volatile int weakr;
+extern volatile int speedr;
 
 volatile int pwmrl = 0;
 
-extern uint8_t buzzerFreq;
-extern uint8_t buzzerPattern;
-
 extern uint8_t enable;
 
-extern volatile uint32_t timeout;
+float voltage = 0;
 
-extern float batteryVoltage;
-extern uint8_t nunchuck_data[6];
-
-
-int milli_vel_error_sum = 0;
+uint16_t set_frequency = 0;
+uint16_t is_frequency = 0;
+uint8_t started = 0;
 
 int main(void) {
   HAL_Init();
@@ -83,166 +81,246 @@ int main(void) {
 
   SystemClock_Config();
 
+  HAL_GPIO_WritePin(ENABLE_PORT, ENABLE_PIN, 1);
+
   __HAL_RCC_DMA1_CLK_DISABLE();
   MX_GPIO_Init();
   MX_TIM_Init();
+  ASYNC_Init();
   MX_ADC1_Init();
-  MX_ADC2_Init();
+  //MX_ADC2_Init();
   UART_Init();
+  I2C_Init();
+  PPM_Init();
 
-  HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, 1);
+
+  lcd.pcf8574.PCF_I2C_ADDRESS = 0x27;
+	lcd.pcf8574.PCF_I2C_TIMEOUT = 5;
+	lcd.pcf8574.i2c = hi2c2;
+	lcd.NUMBER_OF_LINES = NUMBER_OF_LINES_2;
+	lcd.type = TYPE0;
+
+	if(LCD_Init(&lcd)!=LCD_OK){
+		// error occured
+		//TODO while(1);
+	}
+
+	LCD_ClearDisplay(&lcd);
+  LCD_SetLocation(&lcd, 0, 0);
+	LCD_WriteString(&lcd, "TurboOtter V2.0");
+  LCD_SetLocation(&lcd, 0, 1);
+  LCD_WriteString(&lcd, "Initializing...");
+
 
   HAL_ADC_Start(&hadc1);
-  HAL_ADC_Start(&hadc2);
+  //HAL_ADC_Start(&hadc2);
 
-  for (int i = 8; i >= 0; i--) {
-    buzzerFreq = i;
-    HAL_Delay(100);
-  }
-  buzzerFreq = 0;
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   HAL_GPIO_WritePin(LED_PORT, LED_PIN, 1);
 
-  int lastSpeedL = 0, lastSpeedR = 0;
-  int speedL = 0, speedR = 0;
-  float direction = 1;
-
-  #ifdef CONTROL_PPM
-    PPM_Init();
-  #endif
-
-  #ifdef CONTROL_NUNCHUCK
-    I2C_Init();
-    Nunchuck_Init();
-  #endif
-
   enable = 1;
+  pwmr = 200;
 
+
+  __HAL_RCC_TIM1_CLK_ENABLE();
+  __HAL_RCC_TIM8_CLK_ENABLE();
+
+  HAL_GPIO_WritePin(ENABLE_PORT, ENABLE_PIN, 0);
+
+  int processcounter = 0;
+  set_frequency = 300;
+  LCD_ClearDisplay(&lcd);
   while(1) {
-    HAL_Delay(2);
-
-    #ifdef CONTROL_NUNCHUCK
-      Nunchuck_Read();
-      cmd1 = CLAMP((nunchuck_data[0] - 127) * 10, -1000, 1000); // y - axis. Nunchuck joystick readings range 30 - 230
-      cmd2 = CLAMP((nunchuck_data[1] - 127) * 10, -1000, 1000); // x - axis
-
-      //uint8_t button1 = (uint8_t)nunchuck_data[5] & 1;
-      //uint8_t button2 = (uint8_t)(nunchuck_data[5] >> 1) & 1;
-
-      timeout = 0;
-    #endif
-
-    #ifdef CONTROL_PPM
-      cmd1 = CLAMP((ppm_captured_value[0] - 500) * 2, -1000, 1000);
-      cmd2 = CLAMP((ppm_captured_value[1] - 500) * 2, -1000, 1000);
-    #endif
-
-    #ifdef CONTROL_ADC
-      cmd1 = CLAMP(adc_buffer.l_rx2 - 700, 0, 2350) / 2.35; // ADC values range 0-4095, however full range of our poti only covers 650 - 3050
-      //uint8_t button1 = (uint8_t)(adc_buffer.l_tx2 > 2000);
-
-      timeout = 0;
-    #endif
-
-    // ####### LOW-PASS FILTER #######
-    speed = speed * (1.0 - FILTER) + cmd1 * FILTER;
-    steer = steer * (1.0 - FILTER) + cmd2 * FILTER;
-
-    setScopeChannel(0, (int)speed);
-    setScopeChannel(1, (int)steer);
-
-    // ####### MIXER #######
-    speedR = CLAMP(speed * SPEED_COEFFICIENT -  steer * STEER_COEFFICIENT, -1000, 1000);
-    speedL = CLAMP(speed * SPEED_COEFFICIENT +  steer * STEER_COEFFICIENT, -1000, 1000);
-
-    setScopeChannel(2, (int)speedR);
-    setScopeChannel(3, (int)speedL);
-
-    // ####### SET OUTPUTS #######
-    if ((speedL < lastSpeedL + 50 && speedL > lastSpeedL - 50) && (speedR < lastSpeedR + 50 && speedR > lastSpeedR - 50) && timeout < 50) {
-      pwmr = speedR;
-      pwml = speedL;
+    if (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN) == 0) {
+      while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN) == 0) {}
+      started = !started;
+      HAL_Delay(500);
     }
 
-    lastSpeedL = speedL;
-    lastSpeedR = speedR;
+    processcounter++;
+    if (started == 0) {
+      enable = 0;
+    }
+    if (processcounter > 5 && started == 1) { // do the frequency and voltage measurement
+      processcounter = 0;
+      enable = 0;
+      HAL_Delay(3);
+      ppm_count = 0;
+      temp_delay = 0;
+      HAL_NVIC_EnableIRQ(EXTI3_IRQn); // enable capture interrupt
+      HAL_Delay(130); // wait for measurement
+      is_frequency = 1000000 / rc_delay;
+      HAL_NVIC_DisableIRQ(EXTI3_IRQn); // disable capture interrupt
+      enable = 1;
+    }
+
+    // ############ STATE MASCHINE FOR START #################
+
+
+    if (is_frequency < 180) { // we start with a freerunning set frequncy of 300 Hz
+      //set_frequency += 5;
+      set_frequency = 300;
+    }
+
+    if (is_frequency < 400) { // at this point of ramping up speed we start with a lower voltage of ~130V to minimize losses in the TMP
+      //set_frequency += 5;
+      pwmr = 260;
+    }
+
+    if (is_frequency > 400) { // at higher speeds, we need more voltage to keep up. We increse voltage with speed to about 200V max.
+      //set_frequency += 5;
+      pwmr = MIN(((is_frequency - 400) * 0.8f) + 260, 325);
+    }
+
+    if (is_frequency > 180 && is_frequency < 1200) {  // once the TMP has some momentum, we increse the set frequency as a fixed percentage of the is frequency. Slippage is 35%
+      //set_frequency += 5;
+      set_frequency = is_frequency * 1.35f;
+    }
+
+    if (is_frequency > 1200) {
+      //set_frequency += 5;
+      set_frequency = is_frequency * 1.15f;
+    }
+
+    if (is_frequency > 1250) { // once the TMP has full speed, we reduce the torque. Slippage is 10%
+      //set_frequency += 5;
+      set_frequency = is_frequency * 1.1f;
+    }
+
+    TIM3->ARR = 166666 / set_frequency;
+    HAL_Delay(70);
+
+    HAL_ADC_Start(&hadc1);
+
+    HAL_ADC_PollForConversion(&hadc1, 100);
+
+    int adcResult1 = HAL_ADC_GetValue(&hadc1); //PA0
+    int adcResult2 = HAL_ADC_GetValue(&hadc1); //PA1
+
+    voltage = adcResult1 / 15.65;
+
+    HAL_ADC_Stop(&hadc1);
+
+    refreshDisplay();
+
+    //setScopeChannel(2, (int)adcResult1);
+    //setScopeChannel(3, (int)adcResult2);
+
 
     // ####### LOG TO CONSOLE #######
-    consoleScope();
-
-    timeout=0;
-
-    if (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) {
-      enable = 0;
-      while (HAL_GPIO_ReadPin(BUTTON_PORT, BUTTON_PIN)) {}
-      buzzerFreq = 0;
-      buzzerPattern = 0;
-      for (int i = 0; i < 8; i++) {
-        buzzerFreq = i;
-        HAL_Delay(100);
-      }
-      HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, 0);
-      while(1) {}
-    }
-
-    if (batteryVoltage < BAT_LOW_LVL1 && batteryVoltage > BAT_LOW_LVL2) {
-      buzzerFreq = 5;
-      buzzerPattern = 8;
-    } else if  (batteryVoltage < BAT_LOW_LVL2 && batteryVoltage > BAT_LOW_DEAD) {
-      buzzerFreq = 5;
-      buzzerPattern = 1;
-    } else if  (batteryVoltage < BAT_LOW_DEAD) {
-      buzzerPattern = 0;
-      enable = 0;
-      for (int i = 0; i < 8; i++) {
-        buzzerFreq = i;
-        HAL_Delay(100);
-      }
-      HAL_GPIO_WritePin(OFF_PORT, OFF_PIN, 0);
-      while(1) {}
-    } else {
-      buzzerFreq = 0;
-      buzzerPattern = 0;
-    }
+    //consoleScope();
   }
 }
 
+
+int displaycounter = 0;
+void refreshDisplay() {
+  displaycounter++;
+
+  if (displaycounter % 20 > 10) {
+    //LCD_ClearDisplay(&lcd);
+    LCD_SetLocation(&lcd, 0, 0);
+  	LCD_WriteString(&lcd, "Voltage: ");
+    LCD_SetLocation(&lcd, 10, 0);
+    LCD_WriteString(&lcd, "      ");
+    LCD_SetLocation(&lcd, 10, 0);
+    LCD_WriteFloat(&lcd,voltage,0);
+    LCD_SetLocation(&lcd, 14, 0);
+    LCD_WriteString(&lcd, "V");
+  } else {
+    LCD_SetLocation(&lcd, 0, 0);
+  	LCD_WriteString(&lcd, "Set Freq: ");
+    LCD_SetLocation(&lcd, 10, 0);
+    LCD_WriteString(&lcd, "    ");
+    LCD_SetLocation(&lcd, 10, 0);
+    LCD_WriteFloat(&lcd,set_frequency,0);
+    LCD_SetLocation(&lcd, 14, 0);
+    LCD_WriteString(&lcd, "Hz");
+  }
+
+  if (started == 1) {
+    LCD_SetLocation(&lcd, 0, 1);
+    LCD_WriteString(&lcd, "Is Freq: ");
+    LCD_SetLocation(&lcd, 10, 1);
+    LCD_WriteString(&lcd, "    ");
+    LCD_SetLocation(&lcd, 10, 1);
+    LCD_WriteFloat(&lcd,is_frequency,0);
+    LCD_SetLocation(&lcd, 14, 1);
+    LCD_WriteString(&lcd, "Hz");
+  } else {
+    LCD_SetLocation(&lcd, 0, 1);
+    LCD_WriteString(&lcd, "                ");
+    LCD_SetLocation(&lcd, 0, 1);
+    LCD_WriteString(&lcd, "Stopped!");
+  }
+}
+
+void ASYNC_Init() { // timer that generates the rotating field
+  __HAL_RCC_TIM3_CLK_ENABLE();
+  htim3.Instance = TIM3;
+  htim3.Init.Period = 500;
+  htim3.Init.Prescaler = (SystemCoreClock/DELAY_TIM_FREQUENCY_US)-1;;
+  htim3.Init.ClockDivision = 0;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  HAL_TIM_Base_Init(&htim3);
+  HAL_NVIC_SetPriority(TIM3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(TIM3_IRQn);
+  HAL_TIM_Base_Start_IT(&htim3);
+}
+
+uint16_t secondCounter = 0;
+
+void TIM3_IRQHandler(void)
+{
+  if(enable == 0) {
+    RIGHT_TIM->BDTR &= ~TIM_BDTR_MOE;
+    HAL_GPIO_WritePin(ENABLE_PORT, ENABLE_PIN, 1);
+  } else {
+    RIGHT_TIM->BDTR |= TIM_BDTR_MOE;
+    HAL_GPIO_WritePin(ENABLE_PORT, ENABLE_PIN, 0);
+  }
+  setPWM();
+  HAL_TIM_IRQHandler(&htim3);
+}
+
+
 /** System Clock Configuration
 */
-void SystemClock_Config(void) {
+void SystemClock_Config(void)
+{
+
   RCC_OscInitTypeDef RCC_OscInitStruct;
   RCC_ClkInitTypeDef RCC_ClkInitStruct;
-  RCC_PeriphCLKInitTypeDef PeriphClkInit;
 
-  /**Initializes the CPU, AHB and APB busses clocks
+    /**Initializes the CPU, AHB and APB busses clocks
     */
-  RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState            = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = 16;
-  RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSI_DIV2;
-  RCC_OscInitStruct.PLL.PLLMUL          = RCC_PLL_MUL16;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLMUL = RCC_PLL_MUL8;
   HAL_RCC_OscConfig(&RCC_OscInitStruct);
 
-  /**Initializes the CPU, AHB and APB busses clocks
+    /**Initializes the CPU, AHB and APB busses clocks
     */
-  RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
   HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2);
 
-  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
-  PeriphClkInit.AdcClockSelection    = RCC_ADCPCLK2_DIV8;
-  HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit);
 
-  /**Configure the Systick interrupt time
+    /**Configure the Systick interrupt time
     */
-  HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq() / 1000);
+  HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
 
-  /**Configure the Systick
+    /**Configure the Systick
     */
   HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
 

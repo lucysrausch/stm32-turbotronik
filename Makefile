@@ -1,7 +1,7 @@
 ######################################
 # target
 ######################################
-TARGET = hover
+TARGET = turbotronik
 
 ######################################
 # building variables
@@ -41,11 +41,13 @@ Src/control.c \
 Src/main.c \
 Src/bldc.c \
 Src/comms.c \
+Src/hd44780.c \
+Src/pcf8574.c \
 Src/stm32f1xx_it.c \
 
 # ASM sources
 ASM_SOURCES =  \
-startup_stm32f103xe.s
+startup_stm32f103xb.s
 
 #######################################
 # binaries
@@ -114,7 +116,7 @@ CFLAGS += -MMD -MP -MF"$(@:%.o=%.d)" -MT"$(@:%.o=%.d)"
 # LDFLAGS
 #######################################
 # link script
-LDSCRIPT = STM32F103RCTx_FLASH.ld
+LDSCRIPT = STM32F103C8Tx_FLASH.ld
 
 # libraries
 LIBS = -lc -lm -lnosys
@@ -161,6 +163,10 @@ format:
 #######################################
 clean:
 	-rm -fR .dep $(BUILD_DIR)
+
+flash:
+	st-flash --reset write $(BUILD_DIR)/$(TARGET).bin 0x8000000
+
 
 #######################################
 # dependencies

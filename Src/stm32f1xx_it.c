@@ -209,13 +209,11 @@ void DMA1_Channel5_IRQHandler(void)
 }
 #endif
 
-#ifdef CONTROL_PPM
 void EXTI3_IRQHandler(void)
 {
     PPM_ISR_Callback();
     __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_3);
 }
-#endif
 
 /******************************************************************************/
 /* STM32F1xx Peripheral Interrupt Handlers                                    */
